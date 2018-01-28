@@ -1,14 +1,31 @@
-#include <Arduino.h>
-
-#include <ESP8266WiFi.h>
-#include <WiFiClient.h>
-#include <ESP8266WebServer.h>
-#include <ESP8266HTTPUpdateServer.h>
-#include <SoftwareSerial.h>
+#include <WiFi.h>
+//#include <WiFiClient.h>
+//#include <ESP8266WebServer.h>
+//#include <ESP8266HTTPUpdateServer.h>
+//#include <SoftwareSerial.h>
 #include <NeoPixelBus.h>
 #include <NeoPixelAnimator.h>
 #include <ArduinoJson.h>
 #include "FS.h"
+#include "SPIFFS.h"
+
+// BLE
+#include <BLEDevice.h>
+#include <BLEServer.h>
+#include <BLEUtils.h>
+#include <BLE2902.h>
+
+#define SERVICE_UUID           "0000FFE0-0000-1000-8000-00805F9B34FB" // UART service UUID
+#define CHARACTERISTIC_UUID    "0000FFE1-0000-1000-8000-00805F9B34FB"
+//#define CHARACTERISTIC_UUID_RX "0000FFE1-0000-1000-8000-00805F9B34FB"
+//#define CHARACTERISTIC_UUID_TX "0000FFE2-0000-1000-8000-00805F9B34FB"
+#define BLE_ATTRIBUTE_MAX_VALUE_LENGTH             20
+
+BLECharacteristic *pCharacteristic;
+bool deviceConnected = false;
+uint8_t _txBuffer[BLE_ATTRIBUTE_MAX_VALUE_LENGTH];
+
+// BLE END
 
 #define VERSION "0.0.2"
 
@@ -64,19 +81,20 @@ const char* update_path = "/";
 const char* update_username = "admin";
 const char* update_password = "admin";
 
-const char command_success    = 0x01;
-const char command_fail       = 0x00;
-const char command_ping       = 0x01;
-const char command_current    = 0x02;
-const char command_write      = 0x03;
-const char command_render     = 0x04;
-const char command_list       = 0x05;
-const char command_set        = 0x06;
-const char command_get        = 0x07;
-const char command_version    = 0x08;
-const char command_upgrade    = 0x09;
-const char command_end        = 0x0A; // \n
-const char command_clear      = 0x0B;
+// Answers
+uint8_t command_success    = 0x01;
+uint8_t command_fail       = 0x00;
+uint8_t command_ping       = 0x01;
+uint8_t command_current    = 0x02;
+uint8_t command_write      = 0x03;
+uint8_t command_render     = 0x04;
+uint8_t command_list       = 0x05;
+uint8_t command_set        = 0x06;
+uint8_t command_get        = 0x07;
+uint8_t command_version    = 0x08;
+uint8_t command_upgrade    = 0x09;
+uint8_t command_end        = 0x0A; // \n
+uint8_t command_clear      = 0x0B;
 
 typedef struct
 {
@@ -118,14 +136,14 @@ uint8_t         upgradeBuf[UPGRADE_BUFLEN];
 unsigned int    upgradeBufPos = 0;
 unsigned int    blocksRecieved = 0;
 
-SoftwareSerial BT_Serial(D5, D6);
+//SoftwareSerial BT_Serial(D5, D6);
 
 NeoPixelBus<NeoGrbwFeature, Neo800KbpsMethod> neoPixel(PIXEL_COUNT, PIN_PIXEL);
 NeoPixelAnimator animations(AnimationChannels);
 NeoGamma<NeoGammaTableMethod> colorGamma;
 
-ESP8266WebServer httpServer(80);
-ESP8266HTTPUpdateServer httpUpdater(true);
+//ESP8266WebServer httpServer(80);
+//ESP8266HTTPUpdateServer httpUpdater(true);
 
 uint8_t buttonLastState = HIGH;
 uint8_t turnLeftLastState = HIGH;
@@ -163,10 +181,48 @@ void AnimUpdateFade(const AnimationParam& param);
 
 void init_button();
 void init_colors();
+void initBLE();
 bool write_colorCurrent();
 bool write_config();
 bool read_config();
 void disable_wifi();
+void processPing();
+
+uint8_t value = 0;
+
+bool commandPending = false;
+
+class MyServerCallbacks: public BLEServerCallbacks {
+    void onConnect(BLEServer* pServer) {
+      deviceConnected = true;
+    };
+
+    void onDisconnect(BLEServer* pServer) {
+      deviceConnected = false;
+    }
+};
+
+class MyCallbacks: public BLECharacteristicCallbacks {
+    void onWrite(BLECharacteristic *pCharacteristic) {
+      std::string rxValue = pCharacteristic->getValue();
+
+      if (rxValue.length() > 0) {
+        memset(command_buffer, 0, COMMAND_BUFFER_SIZE);
+        command_buffer_position = 0;
+
+        //        Serial.println("*********");
+        //        Serial.print("Received Value: ");
+        for (int i = 0; i < rxValue.length(); i++) {
+          //          Serial.print(rxValue[i]);
+          command_buffer[command_buffer_position++] = rxValue[i];
+        }
+        //        Serial.println();
+        //        Serial.println("*********");
+
+        commandPending = true;
+      }
+    }
+};
 
 void setup() {
   disable_wifi();
@@ -182,18 +238,21 @@ void setup() {
 
   delay(1000);
   Serial.println("Mounting FS...");
-  if (!SPIFFS.begin()) {
+  if (!SPIFFS.begin(true)) {
     Serial.println("Failed to mount file system");
     return;
   }
 
   Serial.println("Files in /:");
-  Dir dir = SPIFFS.openDir("/");
-  while (dir.next()) {
-    Serial.print(dir.fileName());
+  File root = SPIFFS.open("/");
+  File file = root.openNextFile();
+  while (file) {
+    Serial.print(file.name());
     Serial.print(" ");
-    File f = dir.openFile("r");
-    Serial.println(f.size());
+    if (!file.isDirectory()) {
+      Serial.println(file.size());
+    }
+    file = root.openNextFile();
   }
 
   if (!read_config()) {
@@ -212,9 +271,11 @@ void setup() {
 
   neoPixelPark();
 
-  BT_Serial.begin(9600);
-  delay(1000);
-  BT_Serial.println("AT+NAMEAmbient");
+  initBLE();
+
+  //  BT_Serial.begin(9600);
+  //  delay(1000);
+  //  BT_Serial.println("AT+NAMEAmbient");
 
   Serial.println("Init complete");
 }
@@ -222,8 +283,79 @@ void setup() {
 void loop() {
   // If in upgrading mode - only upgrading supported
   if (isUpgrading) {
-    httpServer.handleClient();
+    //    httpServer.handleClient();
     return;
+  }
+
+
+  if (deviceConnected && commandPending) {
+    commandPending = false;
+    StaticJsonBuffer<COMMAND_JSON_SIZE> jsonBuffer;
+    JsonObject& command = jsonBuffer.parseObject(command_buffer);
+    if (command.containsKey("cmd")) {
+      if (command["cmd"] == "get") {
+        if (command.containsKey("n")) {
+          unsigned int n = command.get<unsigned int>("n");
+          Serial.printf("Get command for n %d\n", n);
+          processGet(n);
+        }
+      } else if (command["cmd"] == "set") {
+        if (command.containsKey("n") && command.containsKey("r")
+            && command.containsKey("g") && command.containsKey("b")
+            && command.containsKey("w"))
+        {
+          unsigned int n = command.get<unsigned int>("n");
+          unsigned int r = command.get<unsigned int>("r");
+          unsigned int g = command.get<unsigned int>("g");
+          unsigned int b = command.get<unsigned int>("b");
+          unsigned int w = command.get<unsigned int>("w");
+          Serial.printf("Set command for n %d to color (R=%d, G=%d, B=%d, W=%d)\n", n, r, g, b, w);
+          processSet(n, r, g, b, w);
+        }
+      } else if (command["cmd"] == "list") {
+        Serial.println("List command found");
+        processList();
+      } else if (command["cmd"] == "render") {
+        if (command.containsKey("n")) {
+          unsigned int n = command.get<unsigned int>("n");
+          Serial.printf("Render n %d color\n", n);
+          processRender(n);
+        } else {
+          if (command.containsKey("r") && command.containsKey("g")
+              && command.containsKey("b") && command.containsKey("w"))
+          {
+            unsigned int r = command.get<unsigned int>("r");
+            unsigned int g = command.get<unsigned int>("g");
+            unsigned int b = command.get<unsigned int>("b");
+            unsigned int w = command.get<unsigned int>("w");
+            Serial.printf("Render color (R=%d, G=%d, B=%d, W=%d)\n", r, g, b, w);
+            processRender(r, g, b, w);
+          }
+        }
+      } else if (command["cmd"] == "write") {
+        Serial.println("Write command found");
+        processWriteAll();
+      } else if (command["cmd"] == "current") {
+        Serial.println("Current command found");
+        processCurrent();
+      } else if (command["cmd"] == "ping") {
+        Serial.println("Ping command found");
+        processPing();
+      } else if (command["cmd"] == "version") {
+        Serial.println("Version command found");
+        processVersion();
+      } else if (command["cmd"] == "upgrade") {
+        if (command.containsKey("size") && command.containsKey("md5")) {
+          unsigned long sz = command.get<unsigned long>("size");
+          String md5 = command.get<String>("md5");
+          Serial.printf("Upgrade, new FW size: %d, MD5: %s\n", sz, md5.c_str());
+          processUpgrade(sz, md5);
+        }
+      } else if (command["cmd"] == "clear") {
+        Serial.println("Clear command found");
+        processClear();
+      }
+    }
   }
 
   if (brakeLastState != digitalRead(PIN_BRAKE)) {
@@ -309,90 +441,6 @@ void loop() {
   if (should_write_at && millis() > should_write_at ) {
     should_write_at = 0;
     write_colorCurrent();
-  }
-
-  if (BT_Serial.available()) {
-    char _char = BT_Serial.read();
-    if (_char == '\n') {
-
-      Serial.print(command_buffer);
-      Serial.println();
-
-      StaticJsonBuffer<COMMAND_JSON_SIZE> jsonBuffer;
-      JsonObject& command = jsonBuffer.parseObject(command_buffer);
-
-      //command.prettyPrintTo(Serial);
-
-      if (command.containsKey("cmd")) {
-        if (command["cmd"] == "get") {
-          if (command.containsKey("n")) {
-            unsigned int n = command.get<unsigned int>("n");
-            Serial.printf("Get command for n %d\n", n);
-            processGet(n);
-          }
-        } else if (command["cmd"] == "set") {
-          if (command.containsKey("n") && command.containsKey("r")
-              && command.containsKey("g") && command.containsKey("b")
-              && command.containsKey("w"))
-          {
-            unsigned int n = command.get<unsigned int>("n");
-            unsigned int r = command.get<unsigned int>("r");
-            unsigned int g = command.get<unsigned int>("g");
-            unsigned int b = command.get<unsigned int>("b");
-            unsigned int w = command.get<unsigned int>("w");
-            Serial.printf("Set command for n %d to color (R=%d, G=%d, B=%d, W=%d)\n", n, r, g, b, w);
-            processSet(n, r, g, b, w);
-          }
-        } else if (command["cmd"] == "list") {
-          Serial.println("List command found");
-          processList();
-        } else if (command["cmd"] == "render") {
-          if (command.containsKey("n")) {
-            unsigned int n = command.get<unsigned int>("n");
-            Serial.printf("Render n %d color\n", n);
-            processRender(n);
-          } else {
-            if (command.containsKey("r") && command.containsKey("g")
-                && command.containsKey("b") && command.containsKey("w"))
-            {
-              unsigned int r = command.get<unsigned int>("r");
-              unsigned int g = command.get<unsigned int>("g");
-              unsigned int b = command.get<unsigned int>("b");
-              unsigned int w = command.get<unsigned int>("w");
-              Serial.printf("Render color (R=%d, G=%d, B=%d, W=%d)\n", r, g, b, w);
-              processRender(r, g, b, w);
-            }
-          }
-        } else if (command["cmd"] == "write") {
-          Serial.println("Write command found");
-          processWriteAll();
-        } else if (command["cmd"] == "current") {
-          Serial.println("Current command found");
-          processCurrent();
-        } else if (command["cmd"] == "ping") {
-          Serial.println("Ping command found");
-          processPing();
-        } else if (command["cmd"] == "version") {
-          Serial.println("Version command found");
-          processVersion();
-        } else if (command["cmd"] == "upgrade") {
-          if (command.containsKey("size") && command.containsKey("md5")) {
-            unsigned long sz = command.get<unsigned long>("size");
-            String md5 = command.get<String>("md5");
-            Serial.printf("Upgrade, new FW size: %d, MD5: %s\n", sz, md5.c_str());
-            processUpgrade(sz, md5);
-          }
-        } else if (command["cmd"] == "clear") {
-          Serial.println("Clear command found");
-          processClear();
-        }
-      }
-
-      memset(command_buffer, 0, COMMAND_BUFFER_SIZE);
-      command_buffer_position = 0;
-    } else {
-      command_buffer[command_buffer_position++] = _char;
-    }
   }
 
   if (animations.IsAnimating()) {
@@ -511,9 +559,9 @@ void neoPixelTurnLeft() {
 
   animations.StopAnimation(3);
   RgbwColor baseTail_faded = RgbwColor::LinearBlend(
-                           colorTailRGBW,
-                           black,
-                           0.7f);
+                               colorTailRGBW,
+                               black,
+                               0.7f);
   colorTailRGBWfaded = baseTail_faded;
   neoPixelClearTo(colorTailRGBWfaded, PIXEL_TAIL_TURN_LEFT_START, PIXEL_TAIL_TURN_LEFT_END);
 
@@ -546,9 +594,9 @@ void neoPixelTurnRight() {
 
   animations.StopAnimation(4);
   RgbwColor baseTail_faded = RgbwColor::LinearBlend(
-                           colorTailRGBW,
-                           black,
-                           0.7f);
+                               colorTailRGBW,
+                               black,
+                               0.7f);
   colorTailRGBWfaded = baseTail_faded;
   neoPixelClearTo(colorTailRGBWfaded, PIXEL_TAIL_TURN_RIGHT_END, PIXEL_TAIL_TURN_RIGHT_START);
 
@@ -593,165 +641,194 @@ void feedUpgradeTimeout() {
   upgradeTimeoutAt = millis() + UPGRADE_FIRMWARE_TIMEOUT;
 }
 
+void writeBLE(uint8_t txValue, uint8_t len = 1) {
+  if (!deviceConnected) return;
+  pCharacteristic->setValue(&txValue, len);
+  pCharacteristic->notify();
+}
+
+void writeBLE(uint8_t* txValue, uint8_t len = 1) {
+  if (!deviceConnected) return;
+  pCharacteristic->setValue(txValue, len);
+  pCharacteristic->notify();
+}
+
+
+void writeBLE(std::string txValue) {
+  if (!deviceConnected) return;
+  pCharacteristic->setValue(txValue);
+  pCharacteristic->notify();
+}
+
 void processClear() {
-  BT_Serial.write(command_clear);
+  writeBLE(command_clear);
   init_colors();
-  BT_Serial.write(command_success);
-  BT_Serial.write(command_end);
+  writeBLE(command_success);
+  writeBLE(command_end);
 }
 
 void processUpgrade(unsigned long sz, String md5) {
-  upgradeSize = sz;
-  isUpgrading = true;
-  upgradeMD5 = md5;
-  /*if (md5.length()) {
-    if (!Update.setMD5(md5.c_str())) {
-      _lastError = HTTP_UE_SERVER_FAULTY_MD5;
-      DEBUG_HTTP_UPDATE("[httpUpdate] Update.setMD5 failed! (%s)\n", md5.c_str());
-      return false;
-    }
-    }*/
-  blocksRecieved = 0;
-  upgradeBufPos = 0;
-  memset(upgradeBuf, 0, UPGRADE_BUFLEN);
-  feedUpgradeTimeout();
-  IPAddress myIP = updateServerUp();
-  Serial.print("Upgrade server is up, IP: ");
-  Serial.println(myIP);
-  BT_Serial.write(command_upgrade);
-  BT_Serial.write(command_success);
-  BT_Serial.print(ssid);
-  BT_Serial.print(F(" "));
-  BT_Serial.print(password);
-  BT_Serial.print(F(" "));
-  BT_Serial.print(myIP);
-  BT_Serial.print(F(" "));
-  BT_Serial.print(update_username);
-  BT_Serial.print(F(" "));
-  BT_Serial.print(update_password);
-  BT_Serial.write(command_end);
+  //  upgradeSize = sz;
+  //  isUpgrading = true;
+  //  upgradeMD5 = md5;
+  //  /*if (md5.length()) {
+  //    if (!Update.setMD5(md5.c_str())) {
+  //      _lastError = HTTP_UE_SERVER_FAULTY_MD5;
+  //      DEBUG_HTTP_UPDATE("[httpUpdate] Update.setMD5 failed! (%s)\n", md5.c_str());
+  //      return false;
+  //    }
+  //    }*/
+  //  blocksRecieved = 0;
+  //  upgradeBufPos = 0;
+  //  memset(upgradeBuf, 0, UPGRADE_BUFLEN);
+  //  feedUpgradeTimeout();
+  //  IPAddress myIP = updateServerUp();
+  //  Serial.print("Upgrade server is up, IP: ");
+  //  Serial.println(myIP);
+  //  writeBLE(command_upgrade);
+  //  writeBLE(command_success);
+  //  BT_Serial.print(ssid);
+  //  BT_Serial.print(F(" "));
+  //  BT_Serial.print(password);
+  //  BT_Serial.print(F(" "));
+  //  BT_Serial.print(myIP);
+  //  BT_Serial.print(F(" "));
+  //  BT_Serial.print(update_username);
+  //  BT_Serial.print(F(" "));
+  //  BT_Serial.print(update_password);
+  //  writeBLE(command_end);
 }
 
 void processVersion() {
-  BT_Serial.write(command_version);
-  BT_Serial.write(command_success);
-  BT_Serial.print(VERSION);
-  BT_Serial.print(F(" "));
-  BT_Serial.print(WiFi.macAddress());
-  BT_Serial.write(command_end);
+  writeBLE(command_version);
+  writeBLE(command_success);
+  writeBLE(VERSION);
+  writeBLE(command_end);
 }
 
 void processPing() {
-  BT_Serial.write(command_ping);
-  BT_Serial.write(command_success);
-  BT_Serial.write(command_end);
+  writeBLE(command_ping);
+  writeBLE(command_success);
+  writeBLE(command_end);
 }
 
 void processCurrent() {
-  BT_Serial.write(command_current);
-  BT_Serial.write(command_success);
-  BT_Serial.write((const uint8_t *)&colorCurrent, sizeof(colorCurrent));
-  BT_Serial.write(command_end);
+  writeBLE(command_current);
+  writeBLE(command_success);
+  writeBLE(colorCurrent);
+  writeBLE(command_end);
 }
 
 void processRender(unsigned int n) {
-  BT_Serial.write(command_render);
+  writeBLE(command_render);
   if (n < COLOR_COUNT) {
     colorCurrent = n;
     colorNeedRGBW = colors[colorCurrent];
 
     neoPixelFadeTo(colorNeedRGBW);
-    BT_Serial.write(command_success);
+    writeBLE(command_success);
+    // shedule save current color
+    should_write_at = millis() + should_write_delay;
   } else {
-    BT_Serial.write(command_fail);
+    writeBLE(command_fail);
   }
-  BT_Serial.write(command_end);
+  writeBLE(command_end);
 }
 
 void processRender(uint8_t r, uint8_t g, uint8_t b, uint8_t w) {
-  BT_Serial.write(command_render);
+  writeBLE(command_render);
   colorNeedRGBW.r = r;
   colorNeedRGBW.g = g;
   colorNeedRGBW.b = b;
   colorNeedRGBW.w = w;
 
   neoPixelFadeTo(colorNeedRGBW);
-  BT_Serial.write(command_success);
-  BT_Serial.write(command_end);
+  writeBLE(command_success);
+  writeBLE(command_end);
 }
 
 void processWriteColorCurrent() {
-  BT_Serial.write(command_write);
+  writeBLE(command_write);
   if (write_colorCurrent()) {
-    BT_Serial.write(command_success);
+    writeBLE(command_success);
   } else {
-    BT_Serial.write(command_fail);
+    writeBLE(command_fail);
   }
-  BT_Serial.write(command_end);
+  writeBLE(command_end);
 }
 
 void processWriteAll() {
-  BT_Serial.write(command_write);
+  writeBLE(command_write);
   if (write_config()) {
-    BT_Serial.write(command_success);
+    writeBLE(command_success);
   } else {
-    BT_Serial.write(command_fail);
+    writeBLE(command_fail);
   }
-  BT_Serial.write(command_end);
+  writeBLE(command_end);
 }
 
 void processSet(unsigned int n, uint8_t r, uint8_t g, uint8_t b, uint8_t w) {
-  BT_Serial.write(command_set);
+  writeBLE(command_set);
   if (n < COLOR_COUNT) {
     colors[n].r = r;
     colors[n].g = g;
     colors[n].b = b;
     colors[n].w = w;
-    BT_Serial.write(command_success);
+    writeBLE(command_success);
   } else {
-    BT_Serial.write(command_fail);
+    writeBLE(command_fail);
   }
-  BT_Serial.write(command_end);
+  writeBLE(command_end);
 }
 
 void processGet(unsigned int n) {
-  BT_Serial.write(command_get);
+  writeBLE(command_get);
   if (n < COLOR_COUNT) {
-    BT_Serial.write(command_success);
-    BT_Serial.write((uint8_t *)&colors[n], sizeof(colors[n]));
+    writeBLE(command_success);
+    memset(_txBuffer, 0, BLE_ATTRIBUTE_MAX_VALUE_LENGTH);
+    _txBuffer[0] = colors[n].r;
+    _txBuffer[1] = colors[n].g;
+    _txBuffer[2] = colors[n].b;
+    _txBuffer[3] = colors[n].w;
+    writeBLE(_txBuffer, 4);
   } else {
-    BT_Serial.write(command_fail);
+    writeBLE(command_fail);
   }
-  BT_Serial.write(command_end);
+  writeBLE(command_end);
 }
 
 void processList() {
-  BT_Serial.write(command_list);
-  BT_Serial.write(command_success);
+  writeBLE(command_list);
+  writeBLE(command_success);
   for (int i = 0; i < COLOR_COUNT; i++) {
-    BT_Serial.write((const uint8_t *)&colors[i], sizeof(colors[i]));
+    memset(_txBuffer, 0, BLE_ATTRIBUTE_MAX_VALUE_LENGTH);
+    _txBuffer[0] = colors[i].r;
+    _txBuffer[1] = colors[i].g;
+    _txBuffer[2] = colors[i].b;
+    _txBuffer[3] = colors[i].w;
+    writeBLE(_txBuffer, 4);
   }
-  BT_Serial.write(command_end);
+  writeBLE(command_end);
 }
 
 IPAddress updateServerUp() {
-  WiFi.forceSleepWake();
-  delay(1);
-  WiFi.mode(WIFI_AP);
-  WiFi.softAP(ssid, password);
-
-  httpUpdater.setup(&httpServer, update_path);
-  //httpUpdater.setup(&httpServer, update_path, update_username, update_password);
-  httpServer.begin();
-
-  IPAddress myIP = WiFi.softAPIP();
-
-  return myIP;
+  //  WiFi.forceSleepWake();
+  //  delay(1);
+  //  WiFi.mode(WIFI_AP);
+  //  WiFi.softAP(ssid, password);
+  //
+  //  httpUpdater.setup(&httpServer, update_path);
+  //  //httpUpdater.setup(&httpServer, update_path, update_username, update_password);
+  //  httpServer.begin();
+  //
+  //  IPAddress myIP = WiFi.softAPIP();
+  //
+  //  return myIP;
 }
 
 void updateServerDown() {
   disable_wifi();
-  httpServer.close();
+  //  httpServer.close();
   Serial.print("Update server ended");
 }
 
@@ -846,6 +923,36 @@ bool read_config() {
 void disable_wifi( ) {
   WiFi.disconnect();
   WiFi.mode(WIFI_OFF);
-  WiFi.forceSleepBegin();
+  //  WiFi.forceSleepBegin();
   delay(1);
 }
+
+void initBLE() {
+  // Create the BLE Device
+  BLEDevice::init("Ambient");
+
+  // Create the BLE Server
+  BLEServer *pServer = BLEDevice::createServer();
+  pServer->setCallbacks(new MyServerCallbacks());
+
+  // Create the BLE Service
+  BLEService *pService = pServer->createService(SERVICE_UUID);
+
+  // Create a BLE Characteristic
+  pCharacteristic = pService->createCharacteristic(
+                      CHARACTERISTIC_UUID,
+                      BLECharacteristic::PROPERTY_READ   |
+                      BLECharacteristic::PROPERTY_WRITE  |
+                      BLECharacteristic::PROPERTY_NOTIFY
+                    );
+  pCharacteristic->setCallbacks(new MyCallbacks());
+  pCharacteristic->addDescriptor(new BLE2902());
+
+  // Start the service
+  pService->start();
+
+  // Start advertising
+  pServer->getAdvertising()->start();
+  Serial.println("Waiting a client connection to notify...");
+}
+
