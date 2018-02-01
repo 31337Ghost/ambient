@@ -267,7 +267,7 @@ void setup() {
   colorCurrentRGBW = colorNeedRGBW = colors[0];
 
   Serial.printf("Rendering %d color from pallete\n", colorCurrent);
-  processRender(colorCurrent);
+  processRender(colorCurrent, false);
 
   neoPixelPark();
 
@@ -319,7 +319,7 @@ void loop() {
         if (command.containsKey("n")) {
           unsigned int n = command.get<unsigned int>("n");
           Serial.printf("Render n %d color\n", n);
-          processRender(n);
+          processRender(n, true);
         } else {
           if (command.containsKey("r") && command.containsKey("g")
               && command.containsKey("b") && command.containsKey("w"))
@@ -719,7 +719,7 @@ void processCurrent() {
   writeBLE(command_end);
 }
 
-void processRender(unsigned int n) {
+void processRender(unsigned int n, bool writeCurrent) {
   writeBLE(command_render);
   if (n < COLOR_COUNT) {
     colorCurrent = n;
@@ -727,8 +727,10 @@ void processRender(unsigned int n) {
 
     neoPixelFadeTo(colorNeedRGBW);
     writeBLE(command_success);
-    // shedule save current color
-    should_write_at = millis() + should_write_delay;
+    if (writeCurrent) {
+      // shedule save current color
+      should_write_at = millis() + should_write_delay;
+    }
   } else {
     writeBLE(command_fail);
   }
