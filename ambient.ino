@@ -15,8 +15,9 @@
 #include <BLEUtils.h>
 #include <BLE2902.h>
 
-#define SERVICE_UUID           "0000FFE0-0000-1000-8000-00805F9B34FB" // UART service UUID
-#define CHARACTERISTIC_UUID    "0000FFE1-0000-1000-8000-00805F9B34FB"
+#define DEVICE_NAME            "Ambnt"
+#define SERVICE_UUID           "2D7A9F0C-E0E8-4CC9-A71B-A21DB2D034A1" // UART service UUID
+#define CHARACTERISTIC_UUID    "82258BAA-DF72-47E8-99BC-B73D7ECD08A5"
 //#define CHARACTERISTIC_UUID_RX "0000FFE1-0000-1000-8000-00805F9B34FB"
 //#define CHARACTERISTIC_UUID_TX "0000FFE2-0000-1000-8000-00805F9B34FB"
 #define BLE_ATTRIBUTE_MAX_VALUE_LENGTH             20
@@ -93,7 +94,7 @@ uint8_t command_set        = 0x06;
 uint8_t command_get        = 0x07;
 uint8_t command_version    = 0x08;
 uint8_t command_upgrade    = 0x09;
-uint8_t command_end        = 0x0A; // \n
+uint8_t command_end[2]     = {0x0D, 0x0A};
 uint8_t command_clear      = 0x0B;
 
 typedef struct
@@ -643,12 +644,18 @@ void feedUpgradeTimeout() {
 
 void writeBLE(uint8_t txValue, uint8_t len = 1) {
   if (!deviceConnected) return;
+  Serial.print("Write uint8_t ");
+  Serial.print(txValue);
+  Serial.println();
   pCharacteristic->setValue(&txValue, len);
   pCharacteristic->notify();
 }
 
 void writeBLE(uint8_t* txValue, uint8_t len = 1) {
   if (!deviceConnected) return;
+  Serial.print("Write uint8_t* ");
+//  Serial.print(txValue);
+  Serial.println();
   pCharacteristic->setValue(txValue, len);
   pCharacteristic->notify();
 }
@@ -656,15 +663,18 @@ void writeBLE(uint8_t* txValue, uint8_t len = 1) {
 
 void writeBLE(std::string txValue) {
   if (!deviceConnected) return;
+  Serial.print("Write std:string ");
+//  Serial.print(txValue);
+  Serial.println();
   pCharacteristic->setValue(txValue);
   pCharacteristic->notify();
 }
 
 void processClear() {
-  writeBLE(command_clear);
   init_colors();
+  writeBLE(command_clear);
   writeBLE(command_success);
-  writeBLE(command_end);
+  writeBLE(command_end, 2);
 }
 
 void processUpgrade(unsigned long sz, String md5) {
@@ -696,27 +706,27 @@ void processUpgrade(unsigned long sz, String md5) {
   //  BT_Serial.print(update_username);
   //  BT_Serial.print(F(" "));
   //  BT_Serial.print(update_password);
-  //  writeBLE(command_end);
+  //  writeBLE(command_end, 2);
 }
 
 void processVersion() {
   writeBLE(command_version);
   writeBLE(command_success);
   writeBLE(VERSION);
-  writeBLE(command_end);
+  writeBLE(command_end, 2);
 }
 
 void processPing() {
   writeBLE(command_ping);
   writeBLE(command_success);
-  writeBLE(command_end);
+  writeBLE(command_end, 2);
 }
 
 void processCurrent() {
   writeBLE(command_current);
   writeBLE(command_success);
   writeBLE(colorCurrent);
-  writeBLE(command_end);
+  writeBLE(command_end, 2);
 }
 
 void processRender(unsigned int n, bool writeCurrent) {
@@ -734,7 +744,7 @@ void processRender(unsigned int n, bool writeCurrent) {
   } else {
     writeBLE(command_fail);
   }
-  writeBLE(command_end);
+  writeBLE(command_end, 2);
 }
 
 void processRender(uint8_t r, uint8_t g, uint8_t b, uint8_t w) {
@@ -746,7 +756,7 @@ void processRender(uint8_t r, uint8_t g, uint8_t b, uint8_t w) {
 
   neoPixelFadeTo(colorNeedRGBW);
   writeBLE(command_success);
-  writeBLE(command_end);
+  writeBLE(command_end, 2);
 }
 
 void processWriteColorCurrent() {
@@ -756,7 +766,7 @@ void processWriteColorCurrent() {
   } else {
     writeBLE(command_fail);
   }
-  writeBLE(command_end);
+  writeBLE(command_end, 2);
 }
 
 void processWriteAll() {
@@ -766,7 +776,7 @@ void processWriteAll() {
   } else {
     writeBLE(command_fail);
   }
-  writeBLE(command_end);
+  writeBLE(command_end, 2);
 }
 
 void processSet(unsigned int n, uint8_t r, uint8_t g, uint8_t b, uint8_t w) {
@@ -780,7 +790,7 @@ void processSet(unsigned int n, uint8_t r, uint8_t g, uint8_t b, uint8_t w) {
   } else {
     writeBLE(command_fail);
   }
-  writeBLE(command_end);
+  writeBLE(command_end, 2);
 }
 
 void processGet(unsigned int n) {
@@ -796,7 +806,7 @@ void processGet(unsigned int n) {
   } else {
     writeBLE(command_fail);
   }
-  writeBLE(command_end);
+  writeBLE(command_end, 2);
 }
 
 void processList() {
@@ -810,7 +820,7 @@ void processList() {
     _txBuffer[3] = colors[i].w;
     writeBLE(_txBuffer, 4);
   }
-  writeBLE(command_end);
+  writeBLE(command_end, 2);
 }
 
 IPAddress updateServerUp() {
@@ -931,7 +941,7 @@ void disable_wifi( ) {
 
 void initBLE() {
   // Create the BLE Device
-  BLEDevice::init("Ambient");
+  BLEDevice::init(DEVICE_NAME);
 
   // Create the BLE Server
   BLEServer *pServer = BLEDevice::createServer();
@@ -953,7 +963,8 @@ void initBLE() {
   // Start the service
   pService->start();
 
-  // Start advertising
+  // Config and start advertising
+  pServer->getAdvertising()->addServiceUUID(BLEUUID(SERVICE_UUID));
   pServer->getAdvertising()->start();
   Serial.println("Waiting a client connection to notify...");
 }
